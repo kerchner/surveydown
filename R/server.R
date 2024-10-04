@@ -158,10 +158,9 @@ sd_server <- function(
 
         admin_table <- admin_data$admin_table_state()
         is_survey_paused <- !is.null(admin_table) && !is.null(admin_table$pausesurvey) && admin_table$pausesurvey
-        is_db_paused <- !is.null(admin_table) && !is.null(admin_table$pausedb) && admin_table$pausedb
 
         if (!is_survey_paused) {
-            if (ignore_mode || is_db_paused) {
+            if (ignore_mode) {
                 # Write to CSV if in ignore mode or if DB is paused
                 if (file.access('.', 2) == 0) {  # Check if current directory is writable
                     tryCatch({
@@ -183,7 +182,7 @@ sd_server <- function(
                 database_uploading(data_list, db$db, db$table, changed_fields)
             }
         } else {
-            message("Survey is paused. Data not saved.")
+            message("Survey is paused.")
         }
 
         # Reset changed_fields after updating the data
@@ -281,18 +280,42 @@ sd_server <- function(
 
     # Admin setup ----
 
-    admin_data <- if (config$admin_page) {
-        admin_enable(input, output, session, db, current_page_id, admin_state, pages, start_page)
-    } else {
-        list(admin_make_content = function() {}, admin_table_state = reactiveVal(NULL))
-    }
-
     is_admin_page <- reactive({
         query <- parseQueryString(session$clientData$url_search)
         !is.null(query[['admin']])
     })
 
+    get_initial_admin_state <- function() {
+        if (is.null(db) || is.null(db$db) || is.null(db$table)) return(FALSE)
+        admin_table <- paste0(db$table, '_admin')
+        tryCatch({
+            result <- DBI::dbGetQuery(db$db, sprintf('SELECT "pausesurvey" FROM "%s" LIMIT 1', admin_table))
+            if (nrow(result) == 0) {
+                DBI::dbExecute(db$db, sprintf('INSERT INTO "%s" ("pausesurvey") VALUES (FALSE)', admin_table))
+                return(FALSE)
+            }
+            return(as.logical(result$pausesurvey))
+        }, error = function(e) {
+            message("Error fetching initial admin state: ", e$message)
+            return(FALSE)
+        })
+    }
+
+    # Get initial pause state
+    initial_pause_state <- get_initial_admin_state()
+
+
+
+
     admin_state <- reactiveVal("login")
+
+    admin_data <- if (config$admin_page) {
+        admin_enable(input, output, session, db, current_page_id, admin_state, pages, start_page, initial_pause_state)
+    } else {
+        list(admin_make_content = function() {}, admin_table_state = reactiveVal(NULL))
+    }
+
+
 
     # Page rendering ----
 
@@ -303,27 +326,24 @@ sd_server <- function(
 
     #Logic for getting the current page, if statements needed for the admin section
     get_current_page <- reactive({
-        admin_table <- admin_data$admin_table_state()
         is_admin <- is_admin_page()
         current_id <- current_page_id()
 
-        if (current_id == "pause-page" ||
-            (!is.null(admin_table) &&
-             !is.null(admin_table$pausesurvey) &&
-             isTRUE(admin_table$pausesurvey) &&
-             !isTRUE(is_admin))) {
-            return(list(id = "pause-page", content = make_pause_page()))
-        }
-
-
-        if (isTRUE(is_admin) && (config$admin_page)) {
+        if (is_admin && config$admin_page) {
             if (admin_state() == "login") {
                 return(list(id = "admin_login", content = admin_make_login()))
             } else if (admin_state() == "content") {
                 return(list(id = "admin_content", content = admin_data$admin_make_content()))
             }
+        } else if (!is_admin) {
+            # Use the reactive admin_table_state to check if survey is paused
+            is_paused <- admin_data$admin_table_state()$pausesurvey
+            if (isTRUE(is_paused)) {
+                return(list(id = "pause-page", content = make_pause_page()))
+            }
         }
 
+        # Regular survey page handling
         page_index <- which(sapply(pages, function(p) p$id == current_id))
         if (length(page_index) == 0) {
             return(pages[[1]])
@@ -355,22 +375,6 @@ sd_server <- function(
         )
     })
 
-    # Observer to handle PauseDB
-    observe({
-        admin_table <- admin_data$admin_table_state()
-        if (!is.null(db) &&
-            !is.null(admin_table) &&
-            !is.null(admin_table$pausedb)) {
-            db$ignore <- isTRUE(admin_table$pausedb)
-            if (db$ignore) {
-                message("Database operations are paused. Data will be saved to CSV.")
-            } else {
-                message("Database operations are active.")
-            }
-        } else if (!is.null(db)) {
-            db$ignore <- FALSE
-        }
-    })
 
     # Page navigation ----
 
@@ -703,30 +707,8 @@ make_pause_page <- function() {
     )
 }
 
-admin_enable <- function(input, output, session, db, current_page_id, admin_state, pages, start_page) {
-    admin_table_state <- reactiveVal(NULL)
-
-    # Function to get current admin state
-    get_admin_state <- function() {
-        if (is.null(db) || is.null(db$db) || is.null(db$table)) return(NULL)
-        admin_table <- paste0(db$table, '_admin')
-        tryCatch({
-            result <- DBI::dbGetQuery(db$db, sprintf('SELECT "pausedb", "pausesurvey" FROM "%s" LIMIT 1', admin_table))
-            if (nrow(result) == 0) {
-                DBI::dbExecute(db$db, sprintf('INSERT INTO "%s" ("pausedb", "pausesurvey") VALUES (FALSE, FALSE)', admin_table))
-                return(data.frame(PauseDB = FALSE, PauseSurvey = FALSE))
-            }
-            return(result)
-        }, error = function(e) {
-            message("Error fetching admin state: ", e$message)
-            return(data.frame(PauseDB = FALSE, PauseSurvey = FALSE))
-        })
-    }
-
-    # Initialize admin_table_state
-    observe({
-        admin_table_state(get_admin_state())
-    })
+admin_enable <- function(input, output, session, db, current_page_id, admin_state, pages, start_page, initial_pause_state) {
+    admin_table_state <- reactiveVal(list(pausesurvey = initial_pause_state))
 
     # Function to return to survey
     return_to_survey <- function() {
@@ -734,10 +716,7 @@ admin_enable <- function(input, output, session, db, current_page_id, admin_stat
             current_state <- admin_table_state()
             admin_state("survey")
 
-            if (is.null(current_state) || is.null(current_state$pausesurvey)) {
-                message("Warning: Unable to determine survey pause state. Defaulting to start page.")
-                current_page_id(start_page)
-            } else if (isTRUE(current_state$pausesurvey)) {
+            if (isTRUE(current_state$pausesurvey)) {
                 message("Survey is paused. Redirecting to pause page.")
                 current_page_id("pause-page")
             } else {
@@ -784,16 +763,12 @@ admin_enable <- function(input, output, session, db, current_page_id, admin_stat
             'UPDATE "%s" SET "%s" = %s',
             admin_table, column, ifelse(value, "TRUE", "FALSE")
         ))
+        admin_table_state(list(pausesurvey = value))
     }
 
     # Pause/Unpause Survey functionality
     observeEvent(input$admin_pause_survey, {
         update_db_state("pausesurvey", input$admin_pause_survey)
-    })
-
-    # Pause/Unpause DB functionality
-    observeEvent(input$admin_pause_db, {
-        update_db_state("pausedb", input$admin_pause_db)
     })
 
     # Download Data button functionality
@@ -820,12 +795,6 @@ admin_enable <- function(input, output, session, db, current_page_id, admin_stat
                 value = current_state$pausesurvey,
                 labelWidth = "120px"
             ),
-            shinyWidgets::switchInput(
-                inputId = "admin_pause_db",
-                label = "Pause DB",
-                value = current_state$pausedb,
-                labelWidth = "120px"
-            ),
             downloadButton("admin_download_data", "Download Data"),
             actionButton("admin_back_to_survey_content", "Back to Survey"),
             hr(),
@@ -840,7 +809,6 @@ admin_enable <- function(input, output, session, db, current_page_id, admin_stat
         admin_table_state = admin_table_state
     ))
 }
-
 
 
 #' Set Password
